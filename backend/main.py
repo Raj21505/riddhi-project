@@ -6,7 +6,7 @@ import pandas as pd
 import io
 import json
 import pickle
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import os
 from datetime import datetime
 from pandas.api import types as pd_types
@@ -24,20 +24,65 @@ from xgboost import XGBClassifier, XGBRegressor
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, mean_squared_error, r2_score
 import numpy as np
 
-# AI Advisor import
-try:
-    # Supports: uvicorn backend.main:app
-    from .ai_advisor import AIAdvisor
-    from .rag_chatbot import BusinessAnalyticsRAG
-    from .what_if_simulator import simulate_scenario, compare_results, generate_explanation
-except ImportError:
-    # Supports: python main.py from backend directory
-    from ai_advisor import AIAdvisor
-    from rag_chatbot import BusinessAnalyticsRAG
-    from what_if_simulator import simulate_scenario, compare_results, generate_explanation
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Lazy-loaded heavy AI modules to avoid blocking startup/port binding.
+_AI_ADVISOR_CLASS = None
+_RAG_CHATBOT_CLASS = None
+_WHAT_IF_FUNCS = None
+
+
+def _get_ai_advisor_class():
+    global _AI_ADVISOR_CLASS
+    if _AI_ADVISOR_CLASS is not None:
+        return _AI_ADVISOR_CLASS
+
+    try:
+        # Supports: uvicorn backend.main:app
+        from .ai_advisor import AIAdvisor as advisor_class
+    except ImportError:
+        # Supports: python main.py from backend directory
+        from ai_advisor import AIAdvisor as advisor_class
+
+    _AI_ADVISOR_CLASS = advisor_class
+    return _AI_ADVISOR_CLASS
+
+
+def _get_rag_chatbot_class():
+    global _RAG_CHATBOT_CLASS
+    if _RAG_CHATBOT_CLASS is not None:
+        return _RAG_CHATBOT_CLASS
+
+    try:
+        # Supports: uvicorn backend.main:app
+        from .rag_chatbot import BusinessAnalyticsRAG as rag_chatbot_class
+    except ImportError:
+        # Supports: python main.py from backend directory
+        from rag_chatbot import BusinessAnalyticsRAG as rag_chatbot_class
+
+    _RAG_CHATBOT_CLASS = rag_chatbot_class
+    return _RAG_CHATBOT_CLASS
+
+
+def _get_what_if_functions():
+    global _WHAT_IF_FUNCS
+    if _WHAT_IF_FUNCS is not None:
+        return _WHAT_IF_FUNCS
+
+    try:
+        # Supports: uvicorn backend.main:app
+        from .what_if_simulator import simulate_scenario, compare_results, generate_explanation
+    except ImportError:
+        # Supports: python main.py from backend directory
+        from what_if_simulator import simulate_scenario, compare_results, generate_explanation
+
+    _WHAT_IF_FUNCS = {
+        "simulate_scenario": simulate_scenario,
+        "compare_results": compare_results,
+        "generate_explanation": generate_explanation,
+    }
+    return _WHAT_IF_FUNCS
 
 # Get environment variables for deployment
 APP_HOST = os.getenv("APP_HOST", "localhost")
@@ -1279,10 +1324,17 @@ async def generate_ai_insights(request: Dict[str, Any]) -> Dict[str, Any]:
         request_api_key = str(request.get('llm_api_key', request.get('openai_api_key', ''))).strip()
         request_provider = str(request.get('llm_provider', '')).strip() or None
 
+        # Import heavy advisor modules only when endpoint is used.
+        try:
+            advisor_class = _get_ai_advisor_class()
+        except Exception as e:
+            logger.error(f"Error loading AI advisor module: {str(e)}")
+            return {"success": False, "error": f"AI advisor dependencies failed to load: {str(e)}"}
+
         # Initialize AI Advisor if not already done, or refresh if caller provided a key.
         if ai_advisor is None or request_api_key or request_provider:
             try:
-                ai_advisor = AIAdvisor(llm_api_key=request_api_key or None, provider=request_provider)
+                ai_advisor = advisor_class(llm_api_key=request_api_key or None, provider=request_provider)
             except ValueError as e:
                 return {"success": False, "error": str(e)}
 
@@ -1579,11 +1631,17 @@ async def build_chatbot_index(request: Dict[str, Any]) -> Dict[str, Any]:
     try:
         global rag_chatbot
 
+        try:
+            rag_chatbot_class = _get_rag_chatbot_class()
+        except Exception as e:
+            logger.error(f"Error loading RAG chatbot module: {str(e)}")
+            return {"success": False, "error": f"RAG dependencies failed to load: {str(e)}"}
+
         request_api_key = str(request.get('llm_api_key', '')).strip() or None
         request_provider = str(request.get('llm_provider', '')).strip() or None
         embedding_model = str(request.get('embedding_model', 'all-MiniLM-L6-v2')).strip()
 
-        rag_chatbot = BusinessAnalyticsRAG(
+        rag_chatbot = rag_chatbot_class(
             embedding_model=embedding_model,
             llm_provider=request_provider,
             llm_api_key=request_api_key,
@@ -1608,6 +1666,12 @@ async def chatbot_query(request: Dict[str, Any]) -> Dict[str, Any]:
     try:
         global rag_chatbot
 
+        try:
+            rag_chatbot_class = _get_rag_chatbot_class()
+        except Exception as e:
+            logger.error(f"Error loading RAG chatbot module: {str(e)}")
+            return {"success": False, "error": f"RAG dependencies failed to load: {str(e)}"}
+
         query = str(request.get('query', '')).strip()
         if not query:
             return {"success": False, "error": "Query must be provided."}
@@ -1617,7 +1681,7 @@ async def chatbot_query(request: Dict[str, Any]) -> Dict[str, Any]:
 
         # Recreate client if caller provides provider/key overrides.
         if rag_chatbot is None or request_api_key or request_provider:
-            rag_chatbot = BusinessAnalyticsRAG(
+            rag_chatbot = rag_chatbot_class(
                 embedding_model='all-MiniLM-L6-v2',
                 llm_provider=request_provider,
                 llm_api_key=request_api_key,
@@ -1724,6 +1788,12 @@ async def simulate_what_if(request: Dict[str, Any]) -> Dict[str, Any]:
     try:
         global cleaned_dataframe, current_dataframe, trained_models, best_model, training_artifacts
 
+        try:
+            what_if_funcs = _get_what_if_functions()
+        except Exception as e:
+            logger.error(f"Error loading what-if simulator module: {str(e)}")
+            return {"success": False, "error": f"What-if dependencies failed to load: {str(e)}"}
+
         if trained_models is None or best_model is None:
             return {"success": False, "error": "No trained model available. Please train a model first."}
 
@@ -1762,7 +1832,7 @@ async def simulate_what_if(request: Dict[str, Any]) -> Dict[str, Any]:
             source_df=source_features_df,
         )
 
-        simulation = simulate_scenario(
+        simulation = what_if_funcs["simulate_scenario"](
             model=model,
             input_data=baseline_input,
             changes=changes,
@@ -1783,12 +1853,12 @@ async def simulate_what_if(request: Dict[str, Any]) -> Dict[str, Any]:
 
         old_pred = simulation.get("old_prediction", {})
         new_pred = simulation.get("new_prediction", {})
-        comparison = compare_results(old_pred, new_pred)
+        comparison = what_if_funcs["compare_results"](old_pred, new_pred)
 
         request_api_key = str(request.get('llm_api_key', '')).strip() or None
         request_provider = str(request.get('llm_provider', '')).strip() or None
 
-        explanation = generate_explanation(
+        explanation = what_if_funcs["generate_explanation"](
             changes=simulation.get("applied_changes", {}),
             old_pred=old_pred,
             new_pred=new_pred,
@@ -1894,6 +1964,12 @@ async def answer_question(request: Dict[str, Any]) -> Dict[str, Any]:
     try:
         global current_dataframe, cleaned_dataframe, trained_models, best_model, rag_chatbot
 
+        try:
+            rag_chatbot_class = _get_rag_chatbot_class()
+        except Exception as e:
+            logger.error(f"Error loading RAG chatbot module: {str(e)}")
+            return {"success": False, "error": f"RAG dependencies failed to load: {str(e)}", "fallback_to_rag": True}
+
         question = str(request.get('question', '')).strip()
         if not question:
             return {"success": False, "error": "Question must be provided"}
@@ -1913,7 +1989,7 @@ async def answer_question(request: Dict[str, Any]) -> Dict[str, Any]:
         request_provider = str(request.get('llm_provider', '')).strip() or None
 
         if rag_chatbot is None or request_api_key or request_provider:
-            rag_chatbot = BusinessAnalyticsRAG(
+            rag_chatbot = rag_chatbot_class(
                 embedding_model='all-MiniLM-L6-v2',
                 llm_provider=request_provider,
                 llm_api_key=request_api_key,
